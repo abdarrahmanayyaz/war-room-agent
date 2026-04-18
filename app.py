@@ -9,8 +9,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from config import WAR_PLAN, CONTACT_INFO
-
 # ── Page Config ───────────────────────────────────────────────────────
 st.set_page_config(
     page_title="WAR ROOM",
@@ -18,6 +16,25 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+from onboarding import (
+    needs_onboarding,
+    render_wizard,
+    render_profile_form,
+    _write_config_local,
+    _upsert_env,
+    _test_gemini,
+    _test_perplexity,
+    _build_resume_context,
+    _build_war_plan,
+    _build_contact_info,
+)
+
+if needs_onboarding():
+    render_wizard()
+    st.stop()
+
+from config import WAR_PLAN, RESUME_CONTEXT, CONTACT_INFO
 
 # ── Dark War Room Theme ───────────────────────────────────────────────
 st.markdown("""
@@ -121,6 +138,8 @@ section[data-testid="stSidebar"] { background-color: #111; }
 .badge-remote { background: #8b5cf622; color: #8b5cf6; border: 1px solid #8b5cf644; }
 .badge-hybrid { background: #f9731622; color: #f97316; border: 1px solid #f9731644; }
 .badge-role { background: #06b6d422; color: #06b6d4; border: 1px solid #06b6d444; }
+.badge-direct { background: #22c55e22; color: #22c55e; border: 1px solid #22c55e44; }
+.badge-perplexity { background: #88888822; color: #888; border: 1px solid #88888844; }
 
 /* Referral check box */
 .referral-check {
@@ -279,6 +298,11 @@ def _load_settings() -> dict:
         "remote_preference": True,
         "weekly_target": WAR_PLAN["weekly_target"],
         "experience_filter": True,
+        "auto_generate_outreach_8plus": True,
+        "tone": "Warm, relationship-first",
+        "hard_rules": "",
+        "start_date": WAR_PLAN.get("start_date"),
+        "plan_days": WAR_PLAN.get("plan_days", 60),
     }
     if os.path.exists(settings_file):
         with open(settings_file) as f:
@@ -317,7 +341,9 @@ from tracker import (
     update_application, get_stats, get_due_followups, get_upcoming_followups,
     get_daily_log, log_activity, export_csv,
 )
-from scout import load_scouted, save_scouted, update_scouted_job
+from scout import load_scouted, save_scouted, update_scouted_job, run_scout
+from scorer import score_jobs
+from tailor import generate_outreach, save_outreach, get_outreach
 from interview_prep import generate_prep, save_prep, get_prep, INTERVIEW_STAGES
 
 settings = _load_settings()
@@ -382,7 +408,6 @@ with tab_scout:
     with filter_cols[5]:
         f_unscored = st.button("Unscored", use_container_width=True, key="f_unscored")
 
-    # Track filter in session state
     if "scout_filter" not in st.session_state:
         st.session_state.scout_filter = "all"
 
@@ -399,46 +424,68 @@ with tab_scout:
     elif f_unscored:
         st.session_state.scout_filter = "unscored"
 
-    # Run scout
+    # Run scout — auto-chained scoring + outreach pre-generation
     if scout_clicked:
-        with st.spinner("Scouting jobs..."):
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+        progress_bar = st.progress(0)
+        status_text = st.empty()
 
-            def scout_progress(msg, pct):
-                progress_bar.progress(min(pct, 1.0))
-                status_text.text(msg)
+        def scout_progress(msg, pct):
+            progress_bar.progress(min(pct, 1.0))
+            status_text.text(f"Scouting... {msg}")
 
-            from scout import run_scout
-            new_jobs = run_scout(wide_net=settings["wide_net"], progress_callback=scout_progress)
+        new_jobs = run_scout(wide_net=settings["wide_net"], progress_callback=scout_progress)
 
-            # Auto-score if enabled
-            if settings["match_scoring"] and new_jobs:
-                status_text.text("Scoring matches...")
-                from scorer import score_jobs
-                score_jobs(new_jobs, progress_callback=scout_progress)
-                # Save updated scores
-                scouted = load_scouted()
-                for nj in new_jobs:
-                    for sj in scouted:
-                        if sj["id"] == nj["id"]:
-                            sj.update({
-                                "score": nj["score"],
-                                "score_reasoning": nj["score_reasoning"],
-                                "score_strengths": nj.get("score_strengths"),
-                                "score_gaps": nj.get("score_gaps"),
-                            })
-                save_scouted(scouted)
+        # Phase 2 — auto-score every new job (never leave unscored in UI)
+        if new_jobs:
+            score_bar = st.progress(0)
 
-            progress_bar.empty()
-            status_text.empty()
-            st.success(f"Found {len(new_jobs)} new roles!")
-            st.rerun()
+            def score_progress(msg, pct):
+                score_bar.progress(min(pct, 1.0))
+                status_text.text(f"Scoring {len(new_jobs)} roles... {msg}")
+
+            score_jobs(new_jobs, progress_callback=score_progress)
+
+            # Persist scores back into scouted.json
+            scouted = load_scouted()
+            for nj in new_jobs:
+                for sj in scouted:
+                    if sj["id"] == nj["id"]:
+                        sj.update({
+                            "score": nj.get("score"),
+                            "score_reasoning": nj.get("score_reasoning"),
+                            "score_strengths": nj.get("score_strengths"),
+                            "score_gaps": nj.get("score_gaps"),
+                        })
+            save_scouted(scouted)
+            score_bar.empty()
+
+            # Phase 3 — pre-generate outreach for 8+ scored jobs
+            high_match = [j for j in new_jobs if (j.get("score") or 0) >= 8 and not get_outreach(j["id"])]
+            if high_match:
+                out_bar = st.progress(0)
+                total_hm = len(high_match)
+                status_text.text(f"Pre-generating outreach for {total_hm} high-match roles...")
+                for idx, job in enumerate(high_match):
+                    try:
+                        outreach = generate_outreach(job, has_referral=False)
+                        save_outreach(job["id"], outreach)
+                        log_activity("outreach_generated", {
+                            "job_id": job["id"],
+                            "company": job.get("company", ""),
+                            "auto": True,
+                        })
+                    except Exception:
+                        pass
+                    out_bar.progress((idx + 1) / total_hm)
+                out_bar.empty()
+
+        progress_bar.empty()
+        status_text.empty()
+        st.toast(f"Found {len(new_jobs)} new roles")
 
     # Display scouted jobs
     scouted_jobs = load_scouted()
 
-    # Apply filters
     active_filter = st.session_state.scout_filter
     if active_filter == "named":
         scouted_jobs = [j for j in scouted_jobs if j.get("discovery") == "named"]
@@ -451,16 +498,44 @@ with tab_scout:
     elif active_filter == "unscored":
         scouted_jobs = [j for j in scouted_jobs if j.get("score") is None]
 
-    # Apply text search
     if search_query:
         sq = search_query.lower()
         scouted_jobs = [j for j in scouted_jobs if sq in j.get("company", "").lower() or sq in j.get("role", "").lower() or sq in j.get("snippet", "").lower()]
 
-    # Sort by score descending (None scores last), then tier
     scouted_jobs.sort(key=lambda j: (-(j.get("score") or 0), j["tier"] if j["tier"] > 0 else 4))
 
-    # Filter out already applied/skipped
-    scouted_jobs = [j for j in scouted_jobs if j.get("status") in ("new", "reviewed")]
+    # Hide processed cards — only show new/unstatused
+    _processed = ("applied", "skipped", "saved", "referral_sent")
+    scouted_jobs = [j for j in scouted_jobs if j.get("status", "new") not in _processed]
+
+    # Batch mode — Process all 7+ roles without saved outreach
+    batch_targets = [
+        j for j in scouted_jobs
+        if (j.get("score") or 0) >= 7 and not get_outreach(j["id"])
+    ]
+    batch_label = f"Process all 7+ roles ({len(batch_targets)})" if batch_targets else "Process all 7+ roles"
+    if st.button(batch_label, disabled=not batch_targets, key="batch_7plus"):
+        bar = st.progress(0)
+        status = st.empty()
+        total_b = len(batch_targets)
+        count = 0
+        for idx, job in enumerate(batch_targets):
+            status.text(f"Generating outreach {idx+1}/{total_b} — {job.get('company', '')}")
+            try:
+                outreach = generate_outreach(job, has_referral=False)
+                save_outreach(job["id"], outreach)
+                log_activity("outreach_generated", {
+                    "job_id": job["id"],
+                    "company": job.get("company", ""),
+                    "auto": True,
+                })
+                count += 1
+            except Exception:
+                pass
+            bar.progress((idx + 1) / total_b)
+        bar.empty()
+        status.empty()
+        st.toast(f"Generated outreach for {count} roles ✓")
 
     if not scouted_jobs:
         st.markdown("*No scouted jobs yet. Hit **Scout** to find roles.*")
@@ -474,6 +549,10 @@ with tab_scout:
         tier_html = _tier_badge(job.get("tier", 0))
         remote_html = _remote_badge(job.get("remote", ""))
         role_type_html = f'<span class="badge badge-role">{job.get("role_type", "AI")}</span>'
+        if job.get("source") == "direct_api":
+            source_html = '<span class="badge badge-direct">DIRECT</span>'
+        else:
+            source_html = '<span class="badge badge-perplexity">PERPLEXITY</span>'
         discovery_label = {"named": "TARGETED", "broad_sweep": "BROAD", "aggregator": "BOARD"}.get(job.get("discovery", ""), "")
         reasoning = job.get("score_reasoning") or ""
 
@@ -483,110 +562,91 @@ with tab_scout:
             <div style="flex: 1;">
                 <p class="company-name">{job.get('company', 'Unknown')}</p>
                 <p class="role-title">{job.get('role', 'Unknown Role')}</p>
-                <div>{tier_html}{remote_html}{role_type_html}</div>
+                <div>{tier_html}{remote_html}{role_type_html}{source_html}</div>
                 {"<p style='color: #aaa; font-size: 0.8rem; margin-top: 0.4rem; font-family: Inter, sans-serif;'>" + reasoning + "</p>" if reasoning else ""}
                 <p style="color: #555; font-size: 0.7rem; margin-top: 0.3rem;">{job.get('source', '')} &middot; {job.get('scouted_date', '')} &middot; {discovery_label}</p>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # Action row
         job_key = job["id"]
-        col1, col2, col3, col4, col5 = st.columns([1, 1, 1, 1, 1])
 
-        with col1:
-            if st.button("Generate Outreach", key=f"out_{job_key}"):
-                st.session_state[f"show_referral_{job_key}"] = True
+        # Quick Apply + View row
+        qa_col, view_col = st.columns([2, 1])
+        with qa_col:
+            if st.button("⚡ Quick Apply", key=f"qa_{job_key}", use_container_width=True):
+                existing = get_outreach(job["id"])
+                if not existing:
+                    with st.spinner("Generating outreach..."):
+                        try:
+                            existing = generate_outreach(job, has_referral=False)
+                            save_outreach(job["id"], existing)
+                            log_activity("outreach_generated", {
+                                "job_id": job["id"],
+                                "company": job.get("company", ""),
+                                "auto": True,
+                            })
+                        except Exception as e:
+                            st.error(f"Outreach generation failed: {e}")
+                            existing = None
 
-        with col2:
-            if st.button("Log Applied", key=f"apply_{job_key}"):
+                dm_text = (existing or {}).get("linkedin_dm", "") if existing else ""
+                if dm_text:
+                    safe = json.dumps(dm_text)
+                    st.components.v1.html(
+                        f"""<script>navigator.clipboard && navigator.clipboard.writeText({safe});</script>""",
+                        height=0,
+                    )
+                    with st.expander("LinkedIn DM (copied)", expanded=False):
+                        st.code(dm_text, language=None)
+
                 add_application(job, status="applied")
                 update_scouted_job(job["id"], status="applied")
-                st.success(f"Logged {job['company']} as applied!")
-                st.rerun()
-
-        with col3:
-            if st.button("Save", key=f"save_{job_key}"):
-                add_application(job, status="to_apply")
-                update_scouted_job(job["id"], status="reviewed")
-                st.success("Saved!")
-                st.rerun()
-
-        with col4:
-            if st.button("Skip", key=f"skip_{job_key}"):
-                update_scouted_job(job["id"], status="skipped")
-                st.rerun()
-
-        with col5:
+                st.toast(f"Applied to {job.get('company', '')} — {job.get('role', '')} ✓")
+        with view_col:
             if job.get("url"):
-                st.link_button("View Job", job["url"])
+                st.link_button("Open posting", job["url"], use_container_width=True)
 
-        # Referral check prompt
-        if st.session_state.get(f"show_referral_{job_key}"):
-            if settings.get("referral_check", True):
-                st.markdown(f"""
-                <div class="referral-check">
-                    &#9889; <strong>Referral check:</strong> Do you know anyone at {job.get('company', 'this company')}?
-                </div>
-                """, unsafe_allow_html=True)
+        # Inline status buttons
+        s1, s2, s3, s4 = st.columns(4)
+        with s1:
+            if st.button("✅ Applied", key=f"apply_{job_key}", use_container_width=True):
+                add_application(job, status="applied")
+                update_scouted_job(job["id"], status="applied")
+                st.toast(f"Applied to {job.get('company', '')} ✓")
+        with s2:
+            if st.button("🤝 Referral Sent", key=f"ref_{job_key}", use_container_width=True):
+                add_application(job, status="referral_sent")
+                update_scouted_job(job["id"], status="referral_sent")
+                st.toast(f"Referral logged for {job.get('company', '')} ✓")
+        with s3:
+            if st.button("💾 Save", key=f"save_{job_key}", use_container_width=True):
+                update_scouted_job(job["id"], status="saved")
+                st.toast("Saved ✓")
+        with s4:
+            if st.button("⏭️ Skip", key=f"skip_{job_key}", use_container_width=True):
+                update_scouted_job(job["id"], status="skipped")
+                st.toast("Skipped ✓")
 
-                ref_col1, ref_col2 = st.columns(2)
-                with ref_col1:
-                    has_ref = st.button("Yes, I have a contact", key=f"ref_yes_{job_key}")
-                with ref_col2:
-                    no_ref = st.button("No, go cold", key=f"ref_no_{job_key}")
+        # Inline outreach display if already generated
+        existing_outreach = get_outreach(job["id"])
+        if existing_outreach:
+            with st.expander("Outreach Drafts"):
+                st.markdown("**Tailored Resume Bullets**")
+                for b in existing_outreach.get("bullets", []):
+                    st.markdown(f"- {b}")
 
-                if has_ref or no_ref:
-                    with st.spinner("Generating outreach..."):
-                        from tailor import generate_outreach, save_outreach
-                        outreach = generate_outreach(job, has_referral=has_ref)
-                        save_outreach(job["id"], outreach)
-                        log_activity("outreach_generated", {"company": job["company"], "role": job["role"]})
-                    st.session_state[f"show_outreach_{job_key}"] = True
-                    st.session_state[f"outreach_data_{job_key}"] = outreach
-                    st.session_state.pop(f"show_referral_{job_key}", None)
-                    st.rerun()
-            else:
-                # Skip referral check, go straight to outreach
-                with st.spinner("Generating outreach..."):
-                    from tailor import generate_outreach, save_outreach
-                    outreach = generate_outreach(job, has_referral=False)
-                    save_outreach(job["id"], outreach)
-                    log_activity("outreach_generated", {"company": job["company"], "role": job["role"]})
-                st.session_state[f"show_outreach_{job_key}"] = True
-                st.session_state[f"outreach_data_{job_key}"] = outreach
-                st.session_state.pop(f"show_referral_{job_key}", None)
-                st.rerun()
+                st.markdown("**LinkedIn DM**")
+                st.code(existing_outreach.get("linkedin_dm", ""), language=None)
 
-        # Inline outreach display
-        if st.session_state.get(f"show_outreach_{job_key}"):
-            outreach = st.session_state.get(f"outreach_data_{job_key}")
-            if not outreach:
-                from tailor import get_outreach
-                outreach = get_outreach(job["id"])
+                st.markdown("**Cold Email**")
+                st.code(existing_outreach.get("cold_email", ""), language=None)
 
-            if outreach:
-                with st.expander("Outreach Drafts", expanded=True):
-                    # Resume bullets
-                    st.markdown("**Tailored Resume Bullets**")
-                    for b in outreach.get("bullets", []):
-                        st.markdown(f"- {b}")
+                st.markdown("**Cover Letter**")
+                with st.expander("Show full cover letter"):
+                    st.text(existing_outreach.get("cover_letter", ""))
 
-                    # LinkedIn DM
-                    st.markdown("**LinkedIn DM**")
-                    st.code(outreach.get("linkedin_dm", ""), language=None)
-
-                    # Cold Email
-                    st.markdown("**Cold Email**")
-                    st.code(outreach.get("cold_email", ""), language=None)
-
-                    # Cover Letter
-                    st.markdown("**Cover Letter**")
-                    with st.expander("Show full cover letter"):
-                        st.text(outreach.get("cover_letter", ""))
-
-                    # Who to contact
-                    st.markdown(f"**Who to contact:** {outreach.get('who_to_contact', '')}")
+                st.markdown(f"**Who to contact:** {existing_outreach.get('who_to_contact', '')}")
 
         st.markdown("---")
 
@@ -917,48 +977,218 @@ with tab_debrief:
 with tab_settings:
     st.markdown("### Configuration")
 
-    with st.form("settings_form"):
-        wide_net = st.toggle("Wide net mode — search beyond named companies", value=settings["wide_net"])
-        auto_scout = st.toggle("Auto-scout — 7:00 AM daily, macOS notification", value=settings["auto_scout"])
-        match_scoring = st.toggle("Match scoring — use Claude AI to score each role 1-10", value=settings["match_scoring"])
-        referral_check = st.toggle("Referral check prompt — ask before cold outreach", value=settings["referral_check"])
-        auto_followups = st.toggle("Auto-generate follow-ups for stale applications", value=settings["auto_followups"])
-        remote_pref = st.toggle("Remote preference — prioritize remote roles", value=settings["remote_preference"])
-        weekly_target = st.number_input("Weekly target (applications)", min_value=1, max_value=50, value=settings["weekly_target"])
-        experience_filter = st.toggle("Experience filter — skip roles requiring 8+ years", value=settings["experience_filter"])
+    # ── 📝 Profile (editable resume/contact/targets) ──────────────────
+    with st.expander("📝 Profile", expanded=True):
+        # Parse RESUME_CONTEXT back into form fields (best-effort).
+        def _seed_profile_values() -> dict:
+            """Build a values dict from current WAR_PLAN, RESUME_CONTEXT, CONTACT_INFO."""
+            headline = ""
+            differentiators = ""
+            skills = ""
+            education = ""
+            tone = settings.get("tone", "Warm, relationship-first")
+            hard_rules = settings.get("hard_rules", "")
 
-        if st.form_submit_button("Save Settings", type="primary"):
-            new_settings = {
-                "wide_net": wide_net,
-                "auto_scout": auto_scout,
-                "match_scoring": match_scoring,
-                "referral_check": referral_check,
-                "auto_followups": auto_followups,
-                "remote_preference": remote_pref,
-                "weekly_target": weekly_target,
-                "experience_filter": experience_filter,
+            try:
+                lines = RESUME_CONTEXT.splitlines()
+                if lines:
+                    first = lines[0]
+                    if " — " in first:
+                        headline = first.split(" — ", 1)[1].strip()
+                diffs = []
+                for ln in lines:
+                    s = ln.strip()
+                    if not s:
+                        continue
+                    if s[:2].isdigit() or (s[:1].isdigit() and s[1:2] == "."):
+                        diffs.append(s.split(".", 1)[1].strip())
+                differentiators = "\n".join(diffs)
+                for ln in lines:
+                    if ln.startswith("SKILLS:"):
+                        skills = ln.replace("SKILLS:", "", 1).strip()
+                    elif ln.startswith("EDUCATION:"):
+                        education = ln.replace("EDUCATION:", "", 1).strip()
+                    elif ln.startswith("TONE:"):
+                        tone_line = ln.replace("TONE:", "", 1).strip().rstrip(".")
+                        if tone_line:
+                            tone = tone_line
+                    elif ln.startswith("DO NOT mention"):
+                        hr = ln.replace("DO NOT mention", "", 1).strip().rstrip(".")
+                        if hr and hr != "buzzwords you dislike":
+                            hard_rules = hr
+            except Exception:
+                pass
+
+            return {
+                "name": CONTACT_INFO.get("name", ""),
+                "email": CONTACT_INFO.get("email", ""),
+                "phone": CONTACT_INFO.get("phone", ""),
+                "linkedin": CONTACT_INFO.get("linkedin", ""),
+                "github": CONTACT_INFO.get("github", ""),
+                "website": CONTACT_INFO.get("website", ""),
+                "headline": headline,
+                "differentiators": differentiators,
+                "skills": skills,
+                "education": education,
+                "target_roles": list(WAR_PLAN.get("target_roles", [])),
+                "tier_1": "\n".join(WAR_PLAN.get("tier_1", [])),
+                "tier_2": "\n".join(WAR_PLAN.get("tier_2", [])),
+                "tier_3": "\n".join(WAR_PLAN.get("tier_3", [])),
+                "target_comp": WAR_PLAN.get("target_comp", ""),
+                "remote_preference": WAR_PLAN.get("remote_preference", "remote-first") == "remote-first",
+                "weekly_target": WAR_PLAN.get("weekly_target", 10),
+                "min_experience_years": WAR_PLAN.get("min_experience_years", 0),
+                "max_experience_years": WAR_PLAN.get("max_experience_years", 5),
+                "plan_days": WAR_PLAN.get("plan_days", 60),
+                "start_date": WAR_PLAN.get("start_date", ""),
+                "tone": tone,
+                "hard_rules": hard_rules,
             }
-            _save_settings(new_settings)
 
-            # Handle auto-scout toggle
-            if auto_scout:
-                from scheduler import install
-                install()
-            else:
-                from scheduler import uninstall
-                uninstall()
+        current_profile = _seed_profile_values()
+        updated = render_profile_form(current_profile)
 
-            st.success("Settings saved!")
+        if st.session_state.pop("_profile_form_submitted", False):
+            try:
+                new_resume = _build_resume_context(updated)
+                new_plan = _build_war_plan(updated)
+                new_contact = _build_contact_info(updated)
+                _write_config_local(new_plan, new_resume, new_contact)
+                st.toast("Profile saved ✓")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not save profile: {e}")
+
+    # ── ⚙️ Automation toggles ──────────────────────────────────────────
+    with st.expander("⚙️ Automation", expanded=False):
+        with st.form("automation_form"):
+            wide_net = st.toggle("Wide net mode — search beyond named companies", value=settings["wide_net"])
+            auto_scout = st.toggle("Auto-scout — 7:00 AM daily, macOS notification", value=settings["auto_scout"])
+            match_scoring = st.toggle("Match scoring — use Claude AI to score each role 1-10", value=settings["match_scoring"])
+            referral_check = st.toggle("Referral check prompt — ask before cold outreach", value=settings["referral_check"])
+            auto_followups = st.toggle("Auto-generate follow-ups for stale applications", value=settings["auto_followups"])
+            remote_pref = st.toggle("Remote preference — prioritize remote roles", value=settings["remote_preference"])
+            experience_filter = st.toggle("Experience filter — skip roles requiring 8+ years", value=settings["experience_filter"])
+            auto_outreach_8plus = st.toggle(
+                "Auto-generate outreach for 8+ matches (Rule 13)",
+                value=settings.get("auto_generate_outreach_8plus", True),
+            )
+
+            if st.form_submit_button("Save automation", type="primary"):
+                settings["wide_net"] = wide_net
+                settings["auto_scout"] = auto_scout
+                settings["match_scoring"] = match_scoring
+                settings["referral_check"] = referral_check
+                settings["auto_followups"] = auto_followups
+                settings["remote_preference"] = remote_pref
+                settings["experience_filter"] = experience_filter
+                settings["auto_generate_outreach_8plus"] = auto_outreach_8plus
+                _save_settings(settings)
+
+                if auto_scout:
+                    from scheduler import install
+                    install()
+                else:
+                    from scheduler import uninstall
+                    uninstall()
+
+                st.toast("Automation saved ✓")
+                st.rerun()
+
+    # ── 🎨 Preferences (tone, rules, targets, sprint) ──────────────────
+    with st.expander("🎨 Preferences", expanded=False):
+        tone_options = ["Warm, relationship-first", "Direct and concise", "Technical and detailed"]
+        current_tone = settings.get("tone", tone_options[0])
+        tone_idx = tone_options.index(current_tone) if current_tone in tone_options else 0
+
+        tone_pick = st.radio("Outreach tone", tone_options, index=tone_idx, key="pref_tone")
+        hard_rules_val = st.text_area(
+            "Hard rules (injected into every AI prompt)",
+            value=settings.get("hard_rules", ""),
+            height=100,
+            key="pref_hard_rules",
+        )
+        weekly_target_val = st.number_input(
+            "Weekly target (applications)",
+            min_value=1, max_value=50,
+            value=int(settings.get("weekly_target", 10)),
+            key="pref_weekly_target",
+        )
+
+        current_sd = settings.get("start_date") or WAR_PLAN.get("start_date")
+        try:
+            sd_default = datetime.strptime(current_sd, "%Y-%m-%d").date()
+        except Exception:
+            sd_default = datetime.now().date()
+        start_date_val = st.date_input("Start date (DAY X of N counter)", value=sd_default, key="pref_start_date")
+
+        plan_days_val = st.number_input(
+            "Sprint length (days)",
+            min_value=7, max_value=365,
+            value=int(settings.get("plan_days", 60)),
+            key="pref_plan_days",
+        )
+
+        if st.button("Save preferences", type="primary", key="save_prefs_btn"):
+            settings["tone"] = tone_pick
+            settings["hard_rules"] = hard_rules_val
+            settings["weekly_target"] = int(weekly_target_val)
+            settings["start_date"] = start_date_val.isoformat()
+            settings["plan_days"] = int(plan_days_val)
+            _save_settings(settings)
+            st.toast("Preferences saved ✓")
             st.rerun()
 
-    st.markdown("---")
-    st.markdown("### Integrations")
+    # ── 🔑 API keys ────────────────────────────────────────────────────
+    with st.expander("🔑 API keys", expanded=False):
+        gemini_key_env = os.environ.get("GEMINI_API_KEY", "")
+        perplexity_key_env = os.environ.get("PERPLEXITY_API_KEY", "")
 
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**Notion Sync** *(coming in v2)*")
-        st.markdown("Set `NOTION_API_KEY` and `NOTION_DATABASE_ID` env vars to enable.")
-    with col2:
+        def _mask(k: str) -> str:
+            if not k:
+                return ""
+            return k[:6] + "..."
+
+        col_g, col_p = st.columns(2)
+        with col_g:
+            if gemini_key_env:
+                st.markdown(f"**Gemini:** ✅ Connected `{_mask(gemini_key_env)}`")
+            else:
+                st.markdown("**Gemini:** ⚠️ Missing")
+        with col_p:
+            if perplexity_key_env:
+                st.markdown(f"**Perplexity:** ✅ Connected `{_mask(perplexity_key_env)}`")
+            else:
+                st.markdown("**Perplexity:** ⚠️ Missing")
+
+        new_gemini = st.text_input("GEMINI_API_KEY", type="password", key="settings_gemini_key")
+        new_perplexity = st.text_input("PERPLEXITY_API_KEY", type="password", key="settings_perplexity_key")
+
+        bcol1, bcol2, bcol3 = st.columns(3)
+        with bcol1:
+            if st.button("Update keys", key="update_keys_btn"):
+                try:
+                    if new_gemini.strip():
+                        _upsert_env("GEMINI_API_KEY", new_gemini.strip())
+                    if new_perplexity.strip():
+                        _upsert_env("PERPLEXITY_API_KEY", new_perplexity.strip())
+                    st.toast("Keys updated — restart app to apply ✓")
+                except Exception as e:
+                    st.error(f"Could not update keys: {e}")
+        with bcol2:
+            if st.button("Test Gemini", key="test_gemini_btn"):
+                key_to_test = new_gemini.strip() or gemini_key_env
+                ok, msg = _test_gemini(key_to_test)
+                (st.success if ok else st.error)(msg)
+        with bcol3:
+            if st.button("Test Perplexity", key="test_pplx_btn"):
+                key_to_test = new_perplexity.strip() or perplexity_key_env
+                ok, msg = _test_perplexity(key_to_test)
+                (st.success if ok else st.error)(msg)
+
+    # ── 🔗 Integrations ────────────────────────────────────────────────
+    with st.expander("🔗 Integrations", expanded=False):
+        st.info("Notion sync coming soon — track roadmap in README.md")
         st.markdown("**Export Data**")
         csv_data = export_csv()
         if csv_data:
